@@ -283,6 +283,57 @@ matching-core/
 | CallOption | 看涨期权 | ✅ |
 | PutOption | 看跌期权 | ✅ |
 
+## 预测市场支持
+
+### 功能特性
+
+- **三种撮合模式**：NORMAL (标准买卖)、MINT (铸造新代币对)、MERGE (合并为抵押品)
+- **互补代币支持**：YES/NO 二元结果代币，价格自动互补 (price_yes + price_no = 1.00)
+- **统一订单簿**：同时管理 YES 和 NO 代币订单簿，支持跨簿撮合
+- **高精度价格**：使用 PRICE_SCALE (1_000_000) 实现 6 位小数精度
+- **跨簿快照**：支持 YES/NO 订单簿的统一快照和状态恢复
+
+### 撮合条件
+
+| 撮合类型 | 条件 | 说明 |
+|---------|------|------|
+| NORMAL | price_bid ≥ price_ask | 标准买卖撮合 |
+| MINT | price_yes + price_no ≥ 1.00 | 两个互补代币买单铸造新代币对 |
+| MERGE | price_yes + price_no ≤ 1.00 | 两个互补代币卖单合并为抵押品 |
+
+### 快速开始
+
+```rust
+use matching_core::core::orderbook::prediction::*;
+
+// 创建统一订单簿
+let mut market = UnifiedOrderBook::new(market_id);
+
+// 创建 YES 买单 @ 0.65
+let order = PredictionOrder::new(
+    1,                      // market_id
+    TokenType::YES,
+    100,                    // user_id
+    100,                    // making_amount (tokens)
+    65_000_000,             // taking_amount (65 USDC, 6 decimals)
+    OrderAction::Bid,
+    i64::MAX,               // 永不过期
+);
+
+// 转换并撮合
+let mut cmd = OrderConverter::to_order_command(&order, order_id, timestamp);
+market.place_order(&mut cmd);
+
+// 检查撮合结果
+for event in &cmd.matcher_events {
+    println!("Trade: size={}, price={}", event.size, event.price);
+}
+```
+
+### 文档
+
+- [预测市场单文件实现文档](./doc/prediction_market_single_file.md) - 详细的 API 文档和使用示例
+
 ## 项目地址
 ```text
 https://github.com/llc-993/matching-core

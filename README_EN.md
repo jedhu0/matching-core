@@ -623,6 +623,57 @@ matching-core/
 | CallOption | Call option | ✅ |
 | PutOption | Put option | ✅ |
 
+## Prediction Market Support
+
+### Features
+
+- **Three Matching Modes**: NORMAL (standard trading), MINT (mint new token pairs), MERGE (merge to collateral)
+- **Complementary Token Support**: YES/NO binary outcome tokens with automatic price complement (price_yes + price_no = 1.00)
+- **Unified Order Book**: Manages YES and NO token order books simultaneously, supports cross-book matching
+- **High Precision Pricing**: Uses PRICE_SCALE (1_000_000) for 6-decimal precision
+- **Cross-Book Snapshot**: Supports unified snapshot and state recovery for YES/NO order books
+
+### Matching Conditions
+
+| Match Type | Condition | Description |
+|------------|-----------|-------------|
+| NORMAL | price_bid ≥ price_ask | Standard bid-ask matching |
+| MINT | price_yes + price_no ≥ 1.00 | Two complementary token bids mint new token pairs |
+| MERGE | price_yes + price_no ≤ 1.00 | Two complementary token asks merge to collateral |
+
+### Quick Start
+
+```rust
+use matching_core::core::orderbook::prediction::*;
+
+// Create unified order book
+let mut market = UnifiedOrderBook::new(market_id);
+
+// Create YES bid @ 0.65
+let order = PredictionOrder::new(
+    1,                      // market_id
+    TokenType::YES,
+    100,                    // user_id
+    100,                    // making_amount (tokens)
+    65_000_000,             // taking_amount (65 USDC, 6 decimals)
+    OrderAction::Bid,
+    i64::MAX,               // never expire
+);
+
+// Convert and match
+let mut cmd = OrderConverter::to_order_command(&order, order_id, timestamp);
+market.place_order(&mut cmd);
+
+// Check matching results
+for event in &cmd.matcher_events {
+    println!("Trade: size={}, price={}", event.size, event.price);
+}
+```
+
+### Documentation
+
+- [Prediction Market Single File Implementation](./doc/prediction_market_single_file.md) - Detailed API documentation and usage examples
+
 ## Repository
 
 ```text
