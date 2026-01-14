@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 type OrderIdx = usize;
 
 /// SOA 内存布局：订单热数据（缓存友好）
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderHotData {
     order_ids: Vec<OrderId>,    // 订单 ID
     prices: Vec<Price>,         // 价格
@@ -19,7 +19,7 @@ struct OrderHotData {
 }
 
 /// 订单冷数据（低频访问）
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderColdData {
     uid: UserId,
     action: OrderAction,
@@ -28,7 +28,7 @@ struct OrderColdData {
 }
 
 /// 预分配订单池（零分配）
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderPool {
     hot: OrderHotData,
     cold: Vec<OrderColdData>,
@@ -88,7 +88,7 @@ struct PriceBucket {
 }
 
 /// 高性能撮合引擎（深度优化版）
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectOrderBookOptimized {
     symbol_spec: CoreSymbolSpecification,
     

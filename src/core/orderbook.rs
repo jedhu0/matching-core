@@ -6,11 +6,26 @@ pub mod direct;
 pub mod direct_optimized;
 pub mod advanced;
 pub mod simd_utils;
+pub mod prediction;
 
 pub use naive::NaiveOrderBook;
 pub use direct::DirectOrderBook;
 pub use direct_optimized::DirectOrderBookOptimized;
 pub use advanced::AdvancedOrderBook;
+
+// Re-export prediction market types
+pub use prediction::{
+    TokenType,
+    MatchType,
+    MarketId,
+    TokenId,
+    PRICE_SCALE,
+    MarketConfig,
+    PredictionOrder,
+    OrderConverter,
+    PredictionTradeEvent,
+    UnifiedOrderBook,
+};
 
 #[derive(Serialize, Deserialize)]
 pub enum OrderBookState {
