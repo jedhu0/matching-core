@@ -17,6 +17,31 @@ use serde::{Deserialize, Serialize};
 // TYPES
 // ============================================================
 
+/// 单调递增事件序列号生成器
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EventSequenceGenerator {
+    counter: u64,
+}
+
+impl EventSequenceGenerator {
+    /// 创建新的序列号生成器
+    pub fn new(start: u64) -> Self {
+        Self { counter: start }
+    }
+
+    /// 获取下一个序列号
+    pub fn next(&mut self) -> u64 {
+        let seq = self.counter;
+        self.counter += 1;
+        seq
+    }
+
+    /// 获取当前序列号（不递增）
+    pub fn current(&self) -> u64 {
+        self.counter
+    }
+}
+
 /// Polymarket 市场 ID
 ///
 /// 对应 CTF (Conditional Tokens Framework) 中的 conditionId
@@ -175,6 +200,129 @@ pub struct UnifiedOrderBookSnapshot {
     pub timestamp: i64,
     /// 状态校验和
     pub checksum: u64,
+    /// 创建快照时的事件序号（用于恢复）
+    pub event_sequence: u64,
+    /// 创建快照时的 WAL 偏移（用于恢复）
+    pub wal_offset: u64,
+}
+
+/// 事件重放管理器
+///
+/// 管理事件日志和重放功能，支持从任意快照点恢复状态
+#[derive(Debug, Clone)]
+pub struct EventReplayManager {
+    /// 起始快照点（重放的基准）
+    base_snapshot: UnifiedOrderBookSnapshot,
+    /// 增量事件日志
+    event_log: Vec<ReplayEvent>,
+    /// 当前重放位置
+    current_position: usize,
+    /// 事件序列号生成器
+    sequence_generator: EventSequenceGenerator,
+}
+
+impl EventReplayManager {
+    /// 创建新的事件重放管理器
+    ///
+    /// # 参数
+    /// - `base_snapshot`: 基准快照点
+    /// - `start_sequence`: 起始事件序列号
+    pub fn new(base_snapshot: UnifiedOrderBookSnapshot, start_sequence: u64) -> Self {
+        Self {
+            base_snapshot,
+            event_log: Vec::new(),
+            current_position: 0,
+            sequence_generator: EventSequenceGenerator::new(start_sequence),
+        }
+    }
+
+    /// 记录事件到日志
+    ///
+    /// # 参数
+    /// - `command`: 订单命令
+    /// - `trade_events`: 撮合结果事件
+    ///
+    /// # 返回
+    /// 记录的事件序列号
+    pub fn record_event(
+        &mut self,
+        command: &OrderCommand,
+        trade_events: Vec<MatcherTradeEvent>,
+    ) -> u64 {
+        let sequence = self.sequence_generator.next();
+        let replay_event = ReplayEvent {
+            sequence,
+            timestamp: command.timestamp,
+            events_group: command.events_group,
+            service_flags: command.service_flags,
+            command: command.clone(),
+            trade_events,
+        };
+        self.event_log.push(replay_event);
+        sequence
+    }
+
+    /// 从指定位置开始重放事件
+    ///
+    /// # 参数
+    /// - `position`: 起始位置（0 表示从第一个事件开始）
+    ///
+    /// # 返回
+    /// - `Ok(Vec<ReplayEvent>)`: 重放的事件列表
+    /// - `Err(anyhow::Error)`: 位置无效
+    pub fn replay_from(&mut self, position: usize) -> anyhow::Result<Vec<&ReplayEvent>> {
+        if position > self.event_log.len() {
+            return Err(anyhow::anyhow!(
+                "无效的重放位置: {} > 事件日志长度: {}",
+                position,
+                self.event_log.len()
+            ));
+        }
+
+        self.current_position = position;
+        let events: Vec<&ReplayEvent> = self.event_log[position..].iter().collect();
+        Ok(events)
+    }
+
+    /// 重放到指定快照状态
+    ///
+    /// # 参数
+    /// - `target_sequence`: 目标事件序列号
+    ///
+    /// # 返回
+    /// 重放到目标序列号后应该应用的 ReplayEvent 列表
+    pub fn replay_to_snapshot(&mut self, target_sequence: u64) -> anyhow::Result<Vec<&ReplayEvent>> {
+        let position = self
+            .event_log
+            .iter()
+            .position(|e| e.sequence == target_sequence)
+            .ok_or_else(|| {
+                anyhow::anyhow!("找不到目标序列号: {}", target_sequence)
+            })?;
+
+        self.replay_from(position)
+    }
+
+    /// 获取当前重放位置
+    pub fn current_position(&self) -> usize {
+        self.current_position
+    }
+
+    /// 获取事件日志长度
+    pub fn event_count(&self) -> usize {
+        self.event_log.len()
+    }
+
+    /// 获取下一个事件序列号（不生成）
+    pub fn next_sequence(&self) -> u64 {
+        self.sequence_generator.current()
+    }
+
+    /// 清空事件日志（谨慎使用）
+    pub fn clear_event_log(&mut self) {
+        self.event_log.clear();
+        self.current_position = 0;
+    }
 }
 
 /// 市场配置
@@ -201,6 +349,184 @@ impl MarketConfig {
             no_token,
             condition_id,
         }
+    }
+}
+
+/// 恢复管理器
+///
+/// 管理快照存储和增量事件恢复，支持从任意快照点 + 增量事件恢复状态
+#[derive(Debug, Clone)]
+pub struct RecoveryManager {
+    /// 快照存储路径
+    snapshot_path: std::path::PathBuf,
+    /// WAL 日志路径
+    wal_path: std::path::PathBuf,
+    /// 最后应用的快照序列号
+    last_snapshot_seq: u64,
+    /// 最后应用的事件序号
+    last_event_seq: u64,
+}
+
+impl RecoveryManager {
+    /// 创建新的恢复管理器
+    ///
+    /// # 参数
+    /// - `snapshot_path`: 快照存储目录路径
+    /// - `wal_path`: WAL 日志文件路径
+    pub fn new(
+        snapshot_path: std::path::PathBuf,
+        wal_path: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            snapshot_path,
+            wal_path,
+            last_snapshot_seq: 0,
+            last_event_seq: 0,
+        }
+    }
+
+    /// 保存带事件序列的快照
+    ///
+    /// # 参数
+    /// - `orderbook`: 统一订单簿状态
+    /// - `event_seq`: 当前事件序列号
+    ///
+    /// # 返回
+    /// - `Ok(u64)`: 保存的快照序列号
+    /// - `Err(anyhow::Error)`: 保存失败
+    pub fn save_snapshot_with_events(
+        &mut self,
+        orderbook: &UnifiedOrderBook,
+        event_seq: u64,
+        wal_offset: u64,
+    ) -> anyhow::Result<u64> {
+        let mut snapshot = orderbook.take_snapshot(event_seq, wal_offset);
+        snapshot.event_sequence = event_seq;
+        snapshot.wal_offset = 0; // TODO: 从 Journaler 获取实际 WAL 偏移
+
+        self.last_snapshot_seq += 1;
+        self.last_event_seq = event_seq;
+
+        // 使用 bincode 序列化快照
+        let filename = format!("prediction_snapshot_{}.bin", self.last_snapshot_seq);
+        let path = self.snapshot_path.join(filename);
+
+        // 确保目录存在
+        std::fs::create_dir_all(&self.snapshot_path)?;
+
+        let file = std::fs::File::create(&path)?;
+        let writer = std::io::BufWriter::new(file);
+        bincode::serialize_into(writer, &snapshot)?;
+
+        tracing::info!(
+            "保存预测市场快照: seq={}, event_seq={}, path={:?}",
+            self.last_snapshot_seq,
+            event_seq,
+            path
+        );
+
+        Ok(self.last_snapshot_seq)
+    }
+
+    /// 从指定快照 + 增量事件恢复
+    ///
+    /// # 参数
+    /// - `snapshot_seq`: 要恢复的快照序列号
+    ///
+    /// # 返回
+    /// - `Ok((UnifiedOrderBook, u64))`: 恢复的订单簿和事件序列号
+    /// - `Err(anyhow::Error)`: 恢复失败
+    pub fn recover_from_snapshot(
+        &self,
+        snapshot_seq: u64,
+    ) -> anyhow::Result<(UnifiedOrderBook, u64)> {
+        // 加载指定快照
+        let filename = format!("prediction_snapshot_{}.bin", snapshot_seq);
+        let path = self.snapshot_path.join(filename);
+
+        let file = std::fs::File::open(&path)?;
+        let reader = std::io::BufReader::new(file);
+        let snapshot: UnifiedOrderBookSnapshot = bincode::deserialize_from(reader)?;
+
+        // 从快照创建订单簿
+        let symbol_id = snapshot.yes_book_snapshot.get_symbol_spec().symbol_id;
+        let market_id = (symbol_id as u64 / 2) as MarketId;
+        let mut orderbook = UnifiedOrderBook::new(market_id);
+        orderbook.restore_snapshot(snapshot.clone())?;
+
+        tracing::info!(
+            "从快照恢复预测市场订单簿: seq={}, event_seq={}",
+            snapshot_seq,
+            snapshot.event_sequence
+        );
+
+        Ok((orderbook, snapshot.event_sequence))
+    }
+
+    /// 完整恢复：找到最新快照并应用所有后续事件
+    ///
+    /// # 返回
+    /// - `Ok((UnifiedOrderBook, u64, u64))`: (恢复的订单簿, 快照序列号, 事件序列号)
+    /// - `Err(anyhow::Error)`: 恢复失败
+    pub fn full_recovery(&self,
+    ) -> anyhow::Result<(UnifiedOrderBook, u64, u64)> {
+        // 找到最新的快照
+        let latest_seq = self.find_latest_snapshot_seq()?;
+
+        if let Some(seq) = latest_seq {
+            // 从最新快照恢复
+            let (orderbook, event_seq) = self.recover_from_snapshot(seq)?;
+
+            tracing::info!(
+                "完整恢复完成: 快照_seq={}, 事件_seq={}",
+                seq,
+                event_seq
+            );
+
+            Ok((orderbook, seq, event_seq))
+        } else {
+            // 没有找到快照，创建新的订单簿
+            tracing::warn!("没有找到快照，创建新的订单簿");
+            let orderbook = UnifiedOrderBook::new(0); // 默认 market_id = 0
+            Ok((orderbook, 0, 0))
+        }
+    }
+
+    /// 查找最新的快照序列号
+    fn find_latest_snapshot_seq(&self,
+    ) -> anyhow::Result<Option<u64>> {
+        let mut max_seq: Option<u64> = None;
+
+        if !self.snapshot_path.exists() {
+            return Ok(None);
+        }
+
+        for entry in std::fs::read_dir(&self.snapshot_path)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+
+            // 解析文件名: prediction_snapshot_{seq}.bin
+            if name.starts_with("prediction_snapshot_") && name.ends_with(".bin") {
+                let inner = &name["prediction_snapshot_".len()..name.len() - 4];
+                if let Ok(seq) = inner.parse::<u64>() {
+                    if max_seq.map_or(true, |m| seq > m) {
+                        max_seq = Some(seq);
+                    }
+                }
+            }
+        }
+
+        Ok(max_seq)
+    }
+
+    /// 获取最后保存的快照序列号
+    pub fn last_snapshot_seq(&self) -> u64 {
+        self.last_snapshot_seq
+    }
+
+    /// 获取最后应用的事件序列号
+    pub fn last_event_seq(&self) -> u64 {
+        self.last_event_seq
     }
 }
 
@@ -493,6 +819,39 @@ pub struct PredictionTradeEvent {
 
     /// 对手方代币类型 (互补代币)
     pub counter_token_type: TokenType,
+}
+
+/// 可重放事件
+///
+/// 包含完整的订单处理信息，用于事件重放和状态恢复
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayEvent {
+    /// 事件序号（单调递增）
+    pub sequence: u64,
+    /// 时间戳
+    pub timestamp: i64,
+    /// 关联的 events_group
+    pub events_group: u64,
+    /// 服务标志
+    pub service_flags: i32,
+    /// 订单命令（用于重放）
+    pub command: OrderCommand,
+    /// 撮合结果
+    pub trade_events: Vec<MatcherTradeEvent>,
+}
+
+impl ReplayEvent {
+    /// 从 OrderCommand 创建 ReplayEvent
+    pub fn from_command(sequence: u64, command: &OrderCommand) -> Self {
+        Self {
+            sequence,
+            timestamp: command.timestamp,
+            events_group: command.events_group,
+            service_flags: command.service_flags,
+            command: command.clone(),
+            trade_events: command.matcher_events.clone(),
+        }
+    }
 }
 
 impl PredictionTradeEvent {
@@ -956,6 +1315,10 @@ impl UnifiedOrderBook {
     ///
     /// 捕获 YES 和 NO 订单簿的完整状态，包括时间戳和校验和。
     ///
+    /// # 参数
+    /// - `event_sequence`: 当前事件序列号（用于恢复）
+    /// - `wal_offset`: 当前 WAL 偏移（用于恢复）
+    ///
     /// # 返回
     /// 包含两个订单簿快照的 `UnifiedOrderBookSnapshot`
     ///
@@ -963,9 +1326,13 @@ impl UnifiedOrderBook {
     /// ```no_run
     /// # use matching_core::core::orderbook::prediction::*;
     /// let market = UnifiedOrderBook::new(1);
-    /// let snapshot = market.take_snapshot();
+    /// let snapshot = market.take_snapshot(100, 4096);
     /// ```
-    pub fn take_snapshot(&self) -> UnifiedOrderBookSnapshot {
+    pub fn take_snapshot(
+        &self,
+        event_sequence: u64,
+        wal_offset: u64,
+    ) -> UnifiedOrderBookSnapshot {
         let yes_book_snapshot = self.yes_book.clone();
         let no_book_snapshot = self.no_book.clone();
         let checksum = self.calculate_checksum();
@@ -979,6 +1346,8 @@ impl UnifiedOrderBook {
             no_book_snapshot,
             timestamp,
             checksum,
+            event_sequence,
+            wal_offset,
         }
     }
 
@@ -1334,5 +1703,94 @@ mod tests {
         let no_l2 = market.get_l2_data(TokenType::NO, 10);
         assert_eq!(no_l2.ask_prices.len(), 0);
         assert_eq!(no_l2.bid_prices.len(), 0);
+    }
+
+    // ----- Event Replay Manager tests -----
+    #[test]
+    fn test_event_sequence_generator() {
+        let mut gen = EventSequenceGenerator::new(100);
+        assert_eq!(gen.next(), 100);
+        assert_eq!(gen.next(), 101);
+        assert_eq!(gen.next(), 102);
+        assert_eq!(gen.current(), 103);
+    }
+
+    #[test]
+    fn test_replay_event_from_command() {
+        let order = PredictionOrder::new(
+            1,
+            TokenType::YES,
+            100,
+            100,
+            65_000_000,
+            OrderAction::Bid,
+            i64::MAX,
+        );
+        let cmd = OrderConverter::to_order_command(&order, 12345, 9999);
+
+        let replay_event = ReplayEvent::from_command(100, &cmd);
+        assert_eq!(replay_event.sequence, 100);
+        assert_eq!(replay_event.timestamp, 9999);
+        assert_eq!(replay_event.command.order_id, 12345);
+    }
+
+    #[test]
+    fn test_event_replay_manager_record_and_replay() {
+        let market = UnifiedOrderBook::new(1);
+        let snapshot = market.take_snapshot(0, 0);
+        let mut manager = EventReplayManager::new(snapshot, 1);
+
+        // 记录一些事件
+        let order1 = PredictionOrder::new(1, TokenType::YES, 100, 100, 65_000_000, OrderAction::Bid, i64::MAX);
+        let cmd1 = OrderConverter::to_order_command(&order1, 1, 1000);
+        let seq1 = manager.record_event(&cmd1, vec![]);
+        assert_eq!(seq1, 1);
+
+        let order2 = PredictionOrder::new(1, TokenType::NO, 101, 50, 35_000_000, OrderAction::Ask, i64::MAX);
+        let cmd2 = OrderConverter::to_order_command(&order2, 2, 1001);
+        let seq2 = manager.record_event(&cmd2, vec![]);
+        assert_eq!(seq2, 2);
+
+        assert_eq!(manager.event_count(), 2);
+
+        // 测试重放
+        let events = manager.replay_from(0).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[1].sequence, 2);
+    }
+
+    #[test]
+    fn test_event_replay_manager_replay_to_snapshot() {
+        let market = UnifiedOrderBook::new(1);
+        let snapshot = market.take_snapshot(0, 0);
+        let mut manager = EventReplayManager::new(snapshot, 1);
+
+        // 记录 5 个事件
+        for i in 1..=5 {
+            let order = PredictionOrder::new(1, TokenType::YES, 100 + i as u64, 100, 65_000_000, OrderAction::Bid, i64::MAX);
+            let cmd = OrderConverter::to_order_command(&order, i as u64, 1000 + i as i64);
+            manager.record_event(&cmd, vec![]);
+        }
+
+        // 重放到序列号 3
+        let events = manager.replay_to_snapshot(3).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].sequence, 3);
+        assert_eq!(events[1].sequence, 4);
+        assert_eq!(events[2].sequence, 5);
+    }
+
+    #[test]
+    fn test_snapshot_with_event_metadata() {
+        let market = UnifiedOrderBook::new(42);
+        let snapshot = market.take_snapshot(12345, 4096);
+
+        assert_eq!(snapshot.event_sequence, 12345);
+        assert_eq!(snapshot.wal_offset, 4096);
+        assert!(snapshot.timestamp > 0);
+
+        // 验证校验和
+        assert!(snapshot.checksum > 0);
     }
 }

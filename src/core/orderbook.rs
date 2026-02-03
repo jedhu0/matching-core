@@ -25,6 +25,13 @@ pub use prediction::{
     OrderConverter,
     PredictionTradeEvent,
     UnifiedOrderBook,
+    UnifiedOrderBookSnapshot,
+    ReplayEvent,
+    EventReplayManager,
+    RecoveryManager,
+    EventSequenceGenerator,
+    service_flags,
+    match_type_encoding,
 };
 
 #[derive(Serialize, Deserialize)]
